@@ -184,11 +184,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         # 2) Exactly 1 dimension should have stride==1
         env = CompileEnvironment.current()
         stride_one_count = 0
+        stride_one_dim: int | None = None
         element_size = fake_tensor.element_size()
         for dim in range(fake_tensor.ndim):
             stride = env.size_hint(fake_tensor.stride(dim))
             if stride == 1:
                 stride_one_count += 1
+                stride_one_dim = dim
             else:
                 # 3) All other dimensions should have 16-byte aligned strides
                 byte_stride = stride * element_size
@@ -197,6 +199,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         if stride_one_count != 1:
             # There should be exactly one dimension with stride==1
             return False
+        assert stride_one_dim is not None
 
         def valid_block_size(
             block_size: int | torch.SymInt | None, stride: int | torch.SymInt, idx: int
@@ -226,17 +229,40 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         strides = fake_tensor.stride()
         size_stride = collections.deque(zip(sizes, strides, strict=True))
         config = DeviceFunction.current().config
+        tile_elements_per_stage = 1
+        max_range_num_stages = 0
+        fast_axis_tile_elements: int | None = None
+
+        def _update_tile(block_size: int, loop_block_id: int | None) -> None:
+            nonlocal tile_elements_per_stage, max_range_num_stages
+            tile_elements_per_stage *= block_size
+            if loop_block_id is None:
+                return
+            range_num_stages = env.config_spec.range_num_stages.config_get(
+                config.range_num_stages, loop_block_id, 0
+            )
+            if range_num_stages > max_range_num_stages:
+                max_range_num_stages = range_num_stages
+
+        dim_index = -1
         for i, k in enumerate(subscript):
             if k is None:
                 continue
             size, stride = size_stride.popleft()
+            dim_index += 1
+            stride_hint = env.size_hint(stride)
             if isinstance(k, slice):
                 # Slices with steps are not supported in tensor descriptor mode
                 if k.step is not None and k.step != 1:
                     return False
-                block_size = env.allocate_reduction_dimension(size).from_config(config)
+                rdim = env.allocate_reduction_dimension(size)
+                block_size = rdim.from_config(config)
                 if not valid_block_size(block_size, stride, i):
                     return False
+                assert isinstance(block_size, int)
+                _update_tile(block_size, rdim.block_id)
+                if dim_index == stride_one_dim:
+                    fast_axis_tile_elements = block_size
             elif isinstance(k, torch.SymInt):
                 block_id = env.get_block_id(k)
                 if block_id is None:
@@ -244,6 +270,43 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 block_size = env.block_sizes[block_id].from_config(config)
                 if not valid_block_size(block_size, stride, i):
                     return False
+                assert isinstance(block_size, int)
+                _update_tile(block_size, block_id)
+                if dim_index == stride_one_dim:
+                    fast_axis_tile_elements = block_size
+
+        effective_num_stages = max(config.num_stages, max_range_num_stages)
+
+        if effective_num_stages > 1:
+            # Multistage tensor-descriptor lowering allocates a shared-memory ring buffer
+            # and advances by `tile_bytes` each stage. Because the TMA unit demands every
+            # destination landing pad be 128-byte aligned, any tile stride that is not a
+            # multiple of 128 eventually wraps the ring to a misaligned address and
+            # triggers cudaErrorMisalignedAddress on Hopper/Blackwell GPUs.
+            tile_bytes = tile_elements_per_stage * element_size
+            if tile_bytes % 128 != 0:
+                return False
+
+            if fast_axis_tile_elements is None:
+                return False
+
+            other_axis_tile_elements = tile_elements_per_stage // fast_axis_tile_elements
+
+            # Empirically, Hopper/Blackwell fault when the multistage ring stride aliases
+            # the hardware swizzle landing pads. We have observed two problematic bands:
+            #   * 8KB+ tiles where either axis in the descriptor falls between 32 and
+            #     256 elements (covers the regression cases like [8, 256], [16, 128],
+            #     [32, 64], ...).
+            #   * 4KB tiles where the contiguous axis is anything other than 64 elements.
+            # The second case covers the regression in
+            # TestTensorDescriptor::test_multistage_tensor_descriptor_alignment
+            # (block_sizes=[4, 256]).
+            if tile_bytes >= 8192 and 32 <= fast_axis_tile_elements <= 256:
+                return False
+            if tile_bytes >= 8192 and 32 <= other_axis_tile_elements <= 256:
+                return False
+            if tile_bytes == 4096 and fast_axis_tile_elements != 64:
+                return False
 
         return True
 
